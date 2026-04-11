@@ -1,28 +1,28 @@
-# ── Core API ─────────────────────────────────────────────
-fastapi==0.115.2
-uvicorn==0.31.1
-pydantic==2.11.0
-python-multipart==0.0.18
+# ── Core (keep flexible to avoid conflicts) ───────────────
+fastapi>=0.115,<0.125
+uvicorn>=0.30,<0.35
+pydantic>=2.10,<2.13
+python-multipart>=0.0.18
 
-# ── HTTP client ──────────────────────────────────────────
-requests==2.32.4
-httpx==0.28.1
+# ── HTTP ─────────────────────────────────────────────────
+requests>=2.32.4
+httpx>=0.28.1
 
-# ── PDF processing ───────────────────────────────────────
-pdf2image==1.17.0
-pypdf==4.3.1
-pdfplumber==0.11.4
+# ── PDF Processing ───────────────────────────────────────
+pdf2image>=1.17.0
+pypdf>=4.3.1
+pdfplumber>=0.11.4
 
-# ── Image / OCR ──────────────────────────────────────────
-Pillow==10.4.0
-pytesseract==0.3.13
+# ── OCR / Image ──────────────────────────────────────────
+Pillow>=10.4.0
+pytesseract>=0.3.13
 
 # ── LLM ──────────────────────────────────────────────────
-google-generativeai==0.8.3
+google-generativeai>=0.8.3
 
 # ── Utilities ────────────────────────────────────────────
-python-dotenv==1.0.1
+python-dotenv>=1.0.1
 
-# ── Testing ──────────────────────────────────────────────
-pytest==8.3.3
-pytest-asyncio==0.24.0
+# ── Testing (optional in Colab) ───────────────────────────
+pytest>=8.3.3
+pytest-asyncio>=0.24.0
