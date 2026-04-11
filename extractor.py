@@ -399,7 +399,7 @@ class BillExtractor:
                 if OCR_AVAILABLE:
                     ocr_text = _ocr_page(img)
                     rgb = img.convert("RGB")
-                    rgb.save(img_path, "JPEG", quality=85)
+                    rgb.save(img_path, "JPEG")
                 else:
                     ocr_text = ""
                     # Minimal save without OCR
