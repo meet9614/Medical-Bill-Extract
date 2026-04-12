@@ -26,3 +26,5 @@ python-dotenv>=1.0.1
 # ── Testing (optional in Colab) ───────────────────────────
 pytest>=8.3.3
 pytest-asyncio>=0.24.0
+streamlit
+requests
