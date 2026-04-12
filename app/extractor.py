@@ -31,7 +31,13 @@ from typing import List, Optional, Tuple
 
 from dotenv import load_dotenv
 
-load_dotenv()
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+
+load_dotenv(dotenv_path=ENV_PATH)
+
+print("📁 ENV PATH:", ENV_PATH)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -69,6 +75,7 @@ from app.schemas import (
 
 # ── Config ─────────────────────────────────────────────────────────────────
 GOOGLE_API_KEY   = os.getenv("GOOGLE_API_KEY", "")
+print("🔑 API KEY:", GOOGLE_API_KEY[:5] if GOOGLE_API_KEY else "❌ NOT LOADED")
 GEMINI_MODEL     = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 FALLBACK_MODELS  = [
     m.strip()
