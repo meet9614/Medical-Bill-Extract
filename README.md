@@ -2,7 +2,7 @@
 
 Production-ready FastAPI service that extracts structured line items from hospital bills and invoices using a **hybrid OCR + Gemini multimodal pipeline**.
 
-Built for the **Bajaj Finserv Health Datathon 2025**.
+Built for the **Byterverse Hackathon 2026**.
 
 ---
 
