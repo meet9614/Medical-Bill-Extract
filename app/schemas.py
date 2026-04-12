@@ -1,37 +1,56 @@
-"""Pydantic schemas for the medical bill extractor.
 """
-from pydantic import BaseModel
-from typing import Dict, Any, Optional, List
+Pydantic schemas for the Medical Bill Extractor API.
+"""
+
+from typing import List, Optional, Any
+from pydantic import BaseModel, Field
 
 
-class ExtractionRequest(BaseModel):
-    """Request schema for text-based extraction.
-
-    You can send either `text` (raw extracted text from a PDF) or a `filename` as context.
-    """
-    text: Optional[str] = None
-    filename: Optional[str] = None
+class BillItem(BaseModel):
+    item_name: str = Field(..., description="Name or description of the line item")
+    item_amount: float = Field(..., description="Total amount for this line item")
+    item_rate: Optional[float] = Field(None, description="Unit rate / price per unit")
+    item_quantity: Optional[float] = Field(None, description="Quantity of this item")
 
 
-class ExtractionResult(BaseModel):
-    """Response schema for extraction results.
-
-    fields: a mapping of extracted field name -> value
-    confidence: optional overall confidence score (0.0 - 1.0)
-    warnings: optional list of warnings or notes
-    """
-    fields: Dict[str, Any]
-    confidence: Optional[float] = None
-    warnings: Optional[List[str]] = []
-
-
-class HealthRecord(BaseModel):
-    """Example schema representing a simplified medical bill record."""
-    patient_name: Optional[str] = None
-    invoice_number: Optional[str] = None
-    provider: Optional[str] = None
-    date: Optional[str] = None
-    total_amount: Optional[str] = None
+class PageLineItems(BaseModel):
+    page_no: str = Field(..., description="Page number (1-indexed string)")
+    page_type: str = Field(
+        ...,
+        description=(
+            "Type of bill page: 'Bill Summary', 'Bill Detail', "
+            "'Pharmacy Bill', 'Lab Bill', 'Other'"
+        ),
+    )
+    bill_items: List[BillItem] = Field(
+        default_factory=list, description="Extracted line items from this page"
+    )
 
 
-# End of schemas.py
+class ExtractionData(BaseModel):
+    pagewise_line_items: List[PageLineItems] = Field(
+        default_factory=list,
+        description="List of pages with their extracted line items",
+    )
+    total_item_count: int = Field(
+        0, description="Total count of all line items across all pages"
+    )
+    grand_total: Optional[float] = Field(
+        None, description="Grand total as shown on the bill (avoid double counting)"
+    )
+    sub_totals: Optional[dict] = Field(
+        None, description="Category-wise subtotals if present on the bill"
+    )
+
+
+class TokenUsage(BaseModel):
+    total_tokens: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+class ExtractionResponse(BaseModel):
+    is_success: bool
+    token_usage: TokenUsage = Field(default_factory=TokenUsage)
+    data: Optional[ExtractionData] = None
+    error: Optional[str] = None
