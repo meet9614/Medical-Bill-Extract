@@ -112,7 +112,6 @@ Frontend: https://medical-bill-extract-2ashatbzcxn9fkhejaxboe.streamlit.app/
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Liveness check |
-| POST | `/extract-bill-data` | Extract from document URL |
 | POST | `/extract-from-file` | Extract from file upload |
 
 ### Extract from URL
