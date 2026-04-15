@@ -1,4 +1,4 @@
-# Medical Bill Extractor
+# MediData: A Medical Invoice Analyser
 
 Production-ready FastAPI service that extracts structured line items from hospital bills and invoices using a **hybrid OCR + Gemini multimodal pipeline**.
 
