@@ -103,7 +103,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 Swagger UI: [http://localhost:8000/docs](http://13.206.108.88:8000/docs)
 
-Frontend: https://medical-bill-extract-2ashatbzcxn9fkhejaxboe.streamlit.app/
+Frontend: [https://medical-bill-extract-2ashatbzcxn9fkhejaxboe.streamlit.app/](https://medical-bill-extract-2ashatbzcxn9fkhejaxboe.streamlit.app/)
 
 ---
 
