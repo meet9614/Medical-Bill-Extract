@@ -1,0 +1,30 @@
+# VLM fine-tuning track. Install on the GPU box, NOT alongside the FastAPI
+# service -- torch + CUDA wheels are ~3GB and the API server does not need them.
+#
+#   pip install -r requirements-vlm.txt
+#
+# Pinned where a floating version is known to break on Turing (T4).
+
+# Core
+torch>=2.4.0
+torchvision>=0.19.0
+
+# Qwen2-VL support landed in transformers 4.45; earlier versions have no
+# Qwen2VLForConditionalGeneration.
+transformers>=4.49.0
+accelerate>=0.34.0
+peft>=0.13.0
+bitsandbytes>=0.44.0        # 4-bit NF4 + paged_adamw_8bit
+datasets>=3.0.0
+sentencepiece>=0.2.0
+pillow>=10.0.0
+
+# Optional: only needed if you pass messages with embedded image dicts rather
+# than PIL images. Our collator does not require it.
+# qwen-vl-utils>=0.0.8
+
+# Rendering. PyMuPDF is the fallback when poppler-utils is unavailable.
+pymupdf>=1.24.0
+
+# NOT required: the eval/metrics module is deliberately stdlib-only so scoring
+# can be unit-tested on a machine with no ML stack.

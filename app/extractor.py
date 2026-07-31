@@ -26,6 +26,7 @@ import time
 import base64
 import logging
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -89,6 +90,59 @@ BATCH_SIZE       = int(os.getenv("BATCH_SIZE", "3"))
 PDF_DPI          = int(os.getenv("PDF_DPI", "200"))
 USE_MOCK_MODE    = os.getenv("USE_MOCK_MODE", "false").lower() == "true"
 
+# ── OCR tuning ─────────────────────────────────────────────────────────────
+# Was hard-coded to 1500, which discarded 27-33% of the OCR text on dense bill
+# pages -- and truncated from the END, exactly where the later line items and
+# totals live. A 6000-char hint costs ~1500 input tokens (~$0.0002/page), so
+# there is no reason to cut it this close.
+OCR_MAX_CHARS = int(os.getenv("OCR_MAX_CHARS", "6000"))
+
+# Page-level parallelism. pytesseract shells out to the tesseract binary, so
+# the GIL is released and threads do work here.
+#
+# CRITICAL: tesseract 4.x is already internally multi-threaded via OpenMP, so N
+# concurrent instances each spawn their own pool and oversubscribe the CPU.
+# Measured on a 4-core box, 2 pages:
+#
+#     serial                          2.40s
+#     2 workers, OpenMP unrestricted 17.42s   <- 7x SLOWER
+#     serial,    OMP_THREAD_LIMIT=1   7.49s
+#     3 workers, OMP_THREAD_LIMIT=1   3.57s   <- 2.1x faster
+#
+# So the env var below is not a micro-optimisation; without it the thread pool
+# is a large regression. It must be set before the first tesseract call, hence
+# module scope.
+OCR_WORKERS = int(os.getenv("OCR_WORKERS", str(min(4, (os.cpu_count() or 1)))))
+if OCR_WORKERS > 1:
+    os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+
+# Detect and correct page rotation before OCR *and* before sending the image to
+# the model. Measured: a 90-degree-rotated page yields pure noise without this.
+OCR_AUTOROTATE = os.getenv("OCR_AUTOROTATE", "true").lower() == "true"
+
+# Mean word confidence below which the OCR hint is dropped entirely.
+#
+# This is a CATASTROPHIC-GARBAGE GUARD, not a handwriting detector. Measured
+# mean confidence on this corpus:
+#
+#     handwritten, rotated   59.3      printed, dense    65.5
+#     handwritten, on cloth  49.5      printed, dense    86.8
+#                                      printed, clean    88.8 / 74.2
+#
+# The distributions overlap: a dense printed page (65.5) scores higher than one
+# handwritten page and lower than the other. No threshold separates them, and
+# median confidence and %low-confidence-words do no better. So tesseract's
+# confidence CANNOT be used to detect handwriting, and a threshold tuned to
+# catch the handwritten pages would also silently discard good printed ones.
+#
+# 35 therefore only catches pages where OCR has collapsed completely. Whether
+# dropping hints on handwriting actually helps is an open question -- settle it
+# with `python -m vlm.eval.ocr_ab --mode ab`, not with a guessed threshold.
+OCR_MIN_CONFIDENCE = float(os.getenv("OCR_MIN_CONFIDENCE", "35"))
+
+# Master switch for the A/B: does the OCR hint earn its latency at all?
+USE_OCR_HINT = os.getenv("USE_OCR_HINT", "true").lower() == "true"
+
 # ── System prompt for Gemini ───────────────────────────────────────────────
 SYSTEM_PROMPT = """
 You are an expert medical billing analyst. Your task is to extract ALL line items
@@ -142,15 +196,89 @@ def _enhance_image(img) -> "Image":
     return img
 
 
+def _autorotate(img):
+    """
+    Correct page orientation using Tesseract's OSD.
+
+    Returns (possibly rotated image, degrees applied). Applied to the page
+    before OCR *and* before the image is sent to the model -- a sideways page
+    hurts both. OSD's own confidence is often low even when the answer is
+    right, so we act on any non-zero rotation and log the confidence rather
+    than gating on it.
+    """
+    if not (OCR_AVAILABLE and OCR_AUTOROTATE):
+        return img, 0
+    try:
+        osd = pytesseract.image_to_osd(img, output_type=pytesseract.Output.DICT)
+        rotate = int(osd.get("rotate", 0)) % 360
+        if rotate:
+            logger.info(
+                "page rotated %d deg (osd confidence %.1f)",
+                rotate, float(osd.get("orientation_conf", 0.0)),
+            )
+            # PIL rotates counter-clockwise; OSD's `rotate` is the clockwise
+            # correction needed, so expand=True and negate.
+            return img.rotate(-rotate, expand=True), rotate
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"OSD unavailable for this page: {e}")
+    return img, 0
+
+
 def _ocr_page(img) -> str:
-    """Run Tesseract on a PIL image and return raw text."""
+    """
+    OCR a PIL image, returning text only if it looks trustworthy.
+
+    Uses image_to_data rather than image_to_string so text and per-word
+    confidence come from a SINGLE tesseract pass -- calling both would double
+    the cost of the slowest step in the pipeline.
+
+    --psm 6 is deliberate and measured: against pdftotext ground truth it
+    scored 80.7% F1 on numeric tokens versus 6.2% for the psm 3 default. Do not
+    "fix" it to auto page segmentation.
+    """
     if not OCR_AVAILABLE:
         return ""
     try:
         enhanced = _enhance_image(img.copy())
-        text = pytesseract.image_to_string(enhanced, config="--psm 6")
+        data = pytesseract.image_to_data(
+            enhanced, config="--psm 6", output_type=pytesseract.Output.DICT
+        )
+
+        lines: dict[tuple, list] = {}
+        confs = []
+        for i, word in enumerate(data["text"]):
+            if not word.strip():
+                continue
+            try:
+                conf = float(data["conf"][i])
+            except (TypeError, ValueError):
+                continue
+            if conf < 0:
+                continue
+            key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+            lines.setdefault(key, []).append(word)
+            confs.append(conf)
+
+        if not confs:
+            return ""
+
+        mean_conf = sum(confs) / len(confs)
+        if mean_conf < OCR_MIN_CONFIDENCE:
+            logger.info(
+                "dropping OCR hint: mean confidence %.1f < %.1f (OCR has "
+                "collapsed on this page; the model still gets the image)",
+                mean_conf, OCR_MIN_CONFIDENCE,
+            )
+            return ""
+        if mean_conf < 60:
+            # Not actionable automatically -- see the note on OCR_MIN_CONFIDENCE
+            # for why confidence can't be thresholded into a handwriting
+            # detector -- but useful when auditing which pages went wrong.
+            logger.debug("low-confidence OCR (%.1f) on this page", mean_conf)
+
+        text = "\n".join(" ".join(ws) for _, ws in sorted(lines.items()))
         return text.strip()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"OCR failed: {e}")
         return ""
 
@@ -251,8 +379,15 @@ class GeminiCaller:
         for idx, (img_b64, ocr_text, pg_no) in enumerate(
             zip(page_images, ocr_hints, page_numbers)
         ):
+            hint = (ocr_text or "")[:OCR_MAX_CHARS] if USE_OCR_HINT else ""
             parts.append(
-                {"text": f"\n\n--- PAGE {pg_no} ---\nOCR HINT:\n{ocr_text[:1500] if ocr_text else '(no OCR)'}\n\nReturn JSON for this page only:\n"}
+                {
+                    "text": (
+                        f"\n\n--- PAGE {pg_no} ---\n"
+                        f"OCR HINT:\n{hint if hint else '(no reliable OCR - read the image directly)'}\n"
+                        f"\nReturn JSON for this page only:\n"
+                    )
+                }
             )
             parts.append(
                 {
@@ -399,22 +534,34 @@ class BillExtractor:
         page_b64s: List[str] = []
         page_ocr: List[str] = []
 
+        # Pages are independent, and tesseract releases the GIL while the
+        # binary runs, so a thread pool turns the slowest stage in the pipeline
+        # from O(n) into O(n / workers). Order is restored by index afterwards.
+        def _prepare(idx_img):
+            i, img = idx_img
+            img, _deg = _autorotate(img)
+            ocr_text = _ocr_page(img) if OCR_AVAILABLE else ""
+            return i, img, ocr_text
+
         with tempfile.TemporaryDirectory() as tmpdir:
-            for i, img in enumerate(pil_images):
+            t_ocr = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=max(1, OCR_WORKERS)) as pool:
+                prepared = list(pool.map(_prepare, enumerate(pil_images)))
+            prepared.sort(key=lambda r: r[0])
+            logger.info(
+                "OCR+rotation for %d pages in %.1fs (%d workers)",
+                len(pil_images), time.perf_counter() - t_ocr, OCR_WORKERS,
+            )
+
+            for i, img, ocr_text in prepared:
                 img_path = os.path.join(tmpdir, f"page_{i+1}.jpg")
-                # Ensure RGB for JPEG
-                if OCR_AVAILABLE:
-                    ocr_text = _ocr_page(img)
-                    rgb = img.convert("RGB")
-                    rgb.save(img_path, "JPEG")
-                else:
-                    ocr_text = ""
-                    # Minimal save without OCR
-                    try:
-                        img.save(img_path, "JPEG")
-                    except Exception:
-                        # Create blank placeholder
-                        open(img_path, "wb").write(b"")
+                try:
+                    # The ROTATED image is what gets sent to the model, not just
+                    # what gets OCR'd -- a sideways page hurts the VLM too.
+                    img.convert("RGB").save(img_path, "JPEG")
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"could not encode page {i+1}: {e}")
+                    open(img_path, "wb").write(b"")
 
                 page_b64s.append(_encode_image(img_path))
                 page_ocr.append(ocr_text)

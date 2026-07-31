@@ -9,6 +9,8 @@ RUN apt-get update && apt-get install -y \
     poppler-utils \
     tesseract-ocr \
     tesseract-ocr-eng \
+    tesseract-ocr-hin \
+    tesseract-ocr-osd \
     && apt-get clean
 
 # Copy requirements first (for caching)
