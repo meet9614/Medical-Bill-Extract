@@ -38,8 +38,6 @@ ENV_PATH = os.path.join(BASE_DIR, ".env")
 
 load_dotenv(dotenv_path=ENV_PATH)
 
-print("📁 ENV PATH:", ENV_PATH)
-
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -71,24 +69,53 @@ from app.schemas import (
     ExtractionData,
     ExtractionResponse,
     PageLineItems,
+    Reconciliation,
     TokenUsage,
 )
 
 # ── Config ─────────────────────────────────────────────────────────────────
 GOOGLE_API_KEY   = os.getenv("GOOGLE_API_KEY", "")
-print("🔑 API KEY:", GOOGLE_API_KEY[:5] if GOOGLE_API_KEY else "❌ NOT LOADED")
-GEMINI_MODEL     = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Never log any part of the key. Prefixes are enough to identify a key in a
+# leaked log, and server logs routinely end up in shared storage.
+logger.info(
+    "config loaded from %s | GOOGLE_API_KEY %s",
+    ENV_PATH,
+    "present" if GOOGLE_API_KEY else "MISSING",
+)
+# Default is the rolling alias, not a pinned version: gemini-1.5-flash and then
+# gemini-2.5-flash both went stale in this repo and 404'd for new keys. Pin an
+# explicit version in .env for reproducibility; the alias is only a safe default.
+GEMINI_MODEL     = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+# gemini-1.5-flash was retired and now 404s -- keeping it here only wasted a
+# fallback slot and buried the real error behind a misleading one. Run
+# `python list_models.py` to see what a given key can actually call.
 FALLBACK_MODELS  = [
     m.strip()
     for m in os.getenv(
-        "GEMINI_MODEL_FALLBACKS", "gemini-2.0-flash,gemini-1.5-flash"
+        "GEMINI_MODEL_FALLBACKS", "gemini-2.0-flash,gemini-flash-latest"
     ).split(",")
     if m.strip()
 ]
 MAX_RETRIES      = int(os.getenv("MAX_RETRIES", "5"))
+MAX_BACKOFF_SECONDS = int(os.getenv("MAX_BACKOFF_SECONDS", "8"))
+# A dense bill page can carry 25+ line items; three of them in one batch can
+# exceed the old 8192 default, and a truncated response parses to nothing.
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "16384"))
+# Percentage tolerance when checking extracted items against the printed total.
+RECONCILE_TOLERANCE_PCT = float(os.getenv("RECONCILE_TOLERANCE_PCT", "1.0"))
 BATCH_SIZE       = int(os.getenv("BATCH_SIZE", "3"))
 PDF_DPI          = int(os.getenv("PDF_DPI", "200"))
-USE_MOCK_MODE    = os.getenv("USE_MOCK_MODE", "false").lower() == "true"
+def _mock_mode() -> bool:
+    """
+    Read at call time, not import time.
+
+    Module-level constants are frozen when uvicorn first imports the app, and
+    `--reload` only watches .py files -- so editing USE_MOCK_MODE in .env has no
+    effect until the server is fully restarted. Reading it per call means an
+    exported env var works immediately, and a .env edit works after any code
+    reload rather than requiring a restart.
+    """
+    return os.getenv("USE_MOCK_MODE", "false").strip().lower() == "true"
 
 # ── OCR tuning ─────────────────────────────────────────────────────────────
 # Was hard-coded to 1500, which discarded 27-33% of the OCR text on dense bill
@@ -163,6 +190,7 @@ For each PAGE provided, return a JSON object with the following structure:
       "item_quantity": <float or null, quantity>
     }
   ],
+  "printed_total": <float or null, the total PRINTED on this page>,
   "fraud_flags": ["<optional list of suspicious observations>"]
 }
 
@@ -177,9 +205,21 @@ IMPORTANT RULES:
 5. Amounts must be numeric floats, not strings. Strip currency symbols (₹, Rs., $).
 6. For pharmacy memos: each drug line is one item_name. Use the printed Amount column.
 7. If a line shows a returned / credit item (negative), include it with a negative amount.
-8. Fraud indicators to flag: mismatched fonts, white-out / whitener over text,
-   amounts that do not match rate × quantity, duplicate serial numbers.
-9. Return ONLY valid JSON – no markdown fences, no prose.
+8. IDENTICAL REPEATED ROWS ARE REAL. Hospital bills legitimately charge the same
+   service many times (e.g. 20 rows of "BLOOD SUGAR BY GLUCOMETER", or the same
+   consultation fee on consecutive days). Emit every occurrence as its own item.
+   NEVER collapse, merge or deduplicate repeated rows.
+9. printed_total: the grand total / net payable AS PRINTED on the page, if one
+   appears. Copy the printed figure exactly – do not compute it yourself, and do
+   not infer one if the page shows none (use null). This is used to verify the
+   extraction, so a computed value would defeat the check.
+10. Fraud indicators to flag: amounts that do not match rate × quantity,
+    duplicate serial numbers, handwritten alterations over printed text,
+    totals that disagree with the sum of the lines.
+    Do NOT flag white boxes or blanked-out regions – documents in this pipeline
+    are anonymised by covering patient names and letterheads, and that redaction
+    is expected, not suspicious.
+11. Return ONLY valid JSON – no markdown fences, no prose.
 """
 
 # ── Helper ─────────────────────────────────────────────────────────────────
@@ -313,6 +353,15 @@ def _parse_page_result(raw_json: str, page_no: int) -> Tuple[PageLineItems, list
         logger.error(f"JSON parse error on page {page_no}: {e}\nRaw: {raw_json[:300]}")
         return PageLineItems(page_no=str(page_no), page_type="Other", bill_items=[]), []
 
+    # A page that parses as valid JSON but yields no items is the silent
+    # failure mode: tokens were spent, the response looked fine, and the caller
+    # gets an empty bill. Log the shape so the mismatch is visible.
+    if not data.get("bill_items"):
+        logger.warning(
+            "page %s parsed OK but contains NO bill_items. Top-level keys: %s | raw: %s",
+            page_no, list(data.keys()), raw_json[:400].replace("\n", " "),
+        )
+
     items = []
     for raw_item in data.get("bill_items", []):
         try:
@@ -327,12 +376,15 @@ def _parse_page_result(raw_json: str, page_no: int) -> Tuple[PageLineItems, list
         except Exception:
             pass
 
+    fraud_flags = [str(f) for f in (data.get("fraud_flags") or []) if str(f).strip()]
+
     page_line = PageLineItems(
         page_no=str(data.get("page_no", page_no)),
         page_type=str(data.get("page_type", "Bill Detail")),
         bill_items=items,
+        printed_total=_safe_float(data.get("printed_total")),
+        fraud_flags=fraud_flags,
     )
-    fraud_flags = data.get("fraud_flags", [])
     return page_line, fraud_flags
 
 
@@ -354,6 +406,13 @@ class GeminiCaller:
         self.model_queue = [GEMINI_MODEL] + FALLBACK_MODELS
         self._input_tokens = 0
         self._output_tokens = 0
+        # Failure bookkeeping. Without this, a batch where every model failed
+        # returns "{}" per page, which parses cleanly into zero line items --
+        # and the caller cannot distinguish "this bill has no items" from
+        # "the API never answered".
+        self.calls_attempted = 0
+        self.calls_failed = 0
+        self.last_error: Optional[str] = None
 
     @property
     def token_usage(self) -> TokenUsage:
@@ -369,11 +428,19 @@ class GeminiCaller:
         Call Gemini with a batch of page images.
         Returns a list of raw JSON strings (one per page).
         """
-        if USE_MOCK_MODE:
+        if _mock_mode():
+            logger.info("USE_MOCK_MODE is on -- returning dummy data, no API call")
             return [self._mock_response(i) for i in range(len(page_images))]
+
+        self.calls_attempted += 1
 
         if not GEMINI_AVAILABLE or not GOOGLE_API_KEY:
             logger.error("Gemini not configured – set GOOGLE_API_KEY")
+            self.calls_failed += 1
+            self.last_error = (
+                "Gemini is not configured: GOOGLE_API_KEY is missing or the "
+                "google-generativeai package is not installed."
+            )
             return ["{}"] * len(page_images)
 
         # Build content parts: system prompt + pages
@@ -411,17 +478,36 @@ class GeminiCaller:
         )
 
         last_error = None
+        # Record why EACH model failed, not just the last one. Reporting only
+        # the final fallback's error hides the primary model's failure, which is
+        # nearly always the one that explains the problem.
+        per_model_errors: dict = {}
         for model_name in self.model_queue:
             for attempt in range(MAX_RETRIES):
                 try:
                     model = genai.GenerativeModel(model_name)
-                    response = model.generate_content(
-                        parts,
-                        generation_config=genai.types.GenerationConfig(
-                            temperature=0.1,
-                            max_output_tokens=8192,
-                        ),
-                    )
+
+                    # Ask for JSON natively. Without this the model wraps output
+                    # in markdown fences or prefaces it with prose, and we are
+                    # left regex-stripping it downstream. Older SDK versions
+                    # reject the argument, so fall back rather than hard-fail.
+                    try:
+                        cfg = genai.types.GenerationConfig(
+                            # temperature=0 for reproducibility. At 0.1 the same
+                            # bill produced "AL Extin" @ 8.898 on one run and
+                            # "ALE-Eats" @ 8.9 on the next -- harmless here, but
+                            # it makes evaluation runs non-comparable.
+                            temperature=0.0,
+                            max_output_tokens=MAX_OUTPUT_TOKENS,
+                            response_mime_type="application/json",
+                        )
+                    except TypeError:
+                        logger.debug("SDK lacks response_mime_type; using plain config")
+                        cfg = genai.types.GenerationConfig(
+                            temperature=0.0, max_output_tokens=MAX_OUTPUT_TOKENS
+                        )
+
+                    response = model.generate_content(parts, generation_config=cfg)
                     raw = response.text
 
                     # Track token usage if available
@@ -437,13 +523,57 @@ class GeminiCaller:
 
                 except Exception as e:
                     last_error = e
-                    wait = 2 ** attempt
+                    per_model_errors[model_name] = f"{type(e).__name__}: {e}"
+                    # Retrying a malformed request or a bad key fails identically
+                    # every time. Only back off for transient conditions --
+                    # quota, rate limits, timeouts, 5xx.
+                    msg = str(e).lower()
+                    transient = any(
+                        k in msg
+                        for k in (
+                            "quota", "rate limit", "429", "timeout", "deadline",
+                            "unavailable", "503", "500", "internal", "overloaded",
+                            "connection", "temporarily",
+                        )
+                    )
+                    if not transient:
+                        logger.error(
+                            f"Gemini {model_name}: non-retryable error, moving to "
+                            f"next model: {e}"
+                        )
+                        break
+
+                    # Capped at 8s. Uncapped 2**attempt over 5 retries x 3 models
+                    # is ~93s of sleeping per batch, which on a 90-page bill is
+                    # minutes of dead time before anything surfaces.
+                    wait = min(2 ** attempt, MAX_BACKOFF_SECONDS)
                     logger.warning(
-                        f"Gemini {model_name} attempt {attempt+1} failed: {e}. Retrying in {wait}s"
+                        f"Gemini {model_name} attempt {attempt+1}/{MAX_RETRIES} "
+                        f"failed: {e}. Retrying in {wait}s"
                     )
                     time.sleep(wait)
 
-        logger.error(f"All Gemini models failed. Last error: {last_error}")
+        self.calls_failed += 1
+        self.last_error = " | ".join(
+            f"{m}: {err}" for m, err in per_model_errors.items()
+        ) or f"{type(last_error).__name__}: {last_error}"
+
+        logger.error("All Gemini models failed for this batch:")
+        for m, err in per_model_errors.items():
+            logger.error("  %-24s %s", m, err)
+
+        if any("not found" in e.lower() or "404" in e for e in per_model_errors.values()):
+            logger.error(
+                "  -> A 404 here means the model name does not exist on this API "
+                "key/version, not that the key is invalid. List what you can "
+                "actually use:\n"
+                "     python -c \"import os,google.generativeai as g; "
+                "from dotenv import load_dotenv; load_dotenv(); "
+                "g.configure(api_key=os.getenv('GOOGLE_API_KEY')); "
+                "print([m.name for m in g.list_models() "
+                "if 'generateContent' in m.supported_generation_methods])\"\n"
+                "     Then set GEMINI_MODEL and GEMINI_MODEL_FALLBACKS in .env."
+            )
         return ["{}"] * len(page_images)
 
     def _split_batch_response(self, raw: str, expected: int) -> List[str]:
@@ -456,11 +586,35 @@ class GeminiCaller:
         try:
             arr = json.loads(raw)
             if isinstance(arr, list):
+                if len(arr) != expected:
+                    logger.warning(
+                        "batch split: model returned %d objects, expected %d "
+                        "pages -- pages will be misaligned",
+                        len(arr), expected,
+                    )
                 return [json.dumps(item) for item in arr]
             if isinstance(arr, dict):
-                return [json.dumps(arr)]
-        except json.JSONDecodeError:
-            pass
+                # JSON mode makes models prone to wrapping the array in an
+                # object ({"pages": [...]}). Unwrap a single list-valued key
+                # rather than treating the whole envelope as one page.
+                list_values = [v for v in arr.values() if isinstance(v, list)]
+                if expected > 1 and len(list_values) == 1 and len(list_values[0]) == expected:
+                    logger.info(
+                        "batch split: unwrapped %d pages from envelope key(s) %s",
+                        expected, list(arr.keys()),
+                    )
+                    return [json.dumps(item) for item in list_values[0]]
+                if expected > 1:
+                    logger.warning(
+                        "batch split: expected %d pages but got a single object "
+                        "with keys %s -- %d page(s) will be empty",
+                        expected, list(arr.keys()), expected - 1,
+                    )
+                return [json.dumps(arr)] + ["{}"] * (expected - 1)
+        except json.JSONDecodeError as e:
+            logger.warning("batch response is not valid JSON (%s); falling back "
+                           "to regex object extraction. First 300 chars: %s",
+                           e, raw[:300].replace("\n", " "))
 
         # Fallback: try to find individual JSON objects
         objects = re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)?\}", raw, re.DOTALL)
@@ -501,6 +655,11 @@ class BillExtractor:
         self.gemini = GeminiCaller()
 
     def extract(self, file_path: str) -> ExtractionResponse:
+        # Fresh caller per extraction. BillExtractor is a module-level singleton
+        # in app.main, so a caller reused across requests would accumulate token
+        # counts and failure counters -- reporting "3/3 batches failed" for a
+        # 2-page document because it was really counting three separate requests.
+        self.gemini = GeminiCaller()
         try:
             return self._run(file_path)
         except Exception as e:
@@ -572,6 +731,7 @@ class BillExtractor:
         # ── Step 3: Batch pages → Gemini ──────────────────────────────────
         all_page_results: List[PageLineItems] = []
         all_fraud_flags: List[str] = []
+        empty_diagnostics: List[str] = []
 
         for batch_start in range(0, len(page_b64s), BATCH_SIZE):
             batch_b64 = page_b64s[batch_start: batch_start + BATCH_SIZE]
@@ -584,6 +744,57 @@ class BillExtractor:
                 page_result, fraud_flags = _parse_page_result(raw, page_no)
                 all_page_results.append(page_result)
                 all_fraud_flags.extend(fraud_flags)
+
+                # Capture WHY a page came back empty. Without this the caller
+                # sees a valid-looking response with no items and no clue.
+                if not page_result.bill_items:
+                    try:
+                        keys = list(json.loads(_clean_json(raw)).keys())
+                        empty_diagnostics.append(f"page {page_no}: keys={keys}")
+                    except Exception:  # noqa: BLE001
+                        empty_diagnostics.append(
+                            f"page {page_no}: unparseable, starts {raw[:80]!r}"
+                        )
+
+        # ── Step 3b: Did the model actually answer? ────────────────────────
+        # Every failed batch yields "{}" per page, which parses into zero items
+        # without raising. Reporting that as a successful extraction of an empty
+        # bill is worse than failing: downstream systems would record a
+        # legitimate zero-rupee claim. Surface it as an error instead.
+        gem = self.gemini
+        if gem.calls_attempted and gem.calls_failed == gem.calls_attempted:
+            return ExtractionResponse(
+                is_success=False,
+                token_usage=gem.token_usage,
+                error=(
+                    f"Extraction failed: every Gemini request failed "
+                    f"({gem.calls_failed}/{gem.calls_attempted} batches). "
+                    f"Last error -- {gem.last_error}"
+                ),
+            )
+
+        # The model answered and cost tokens, but nothing parsed into items.
+        # Surface it: an empty bill that reports success is indistinguishable
+        # from a genuinely zero-value bill, and downstream that is dangerous.
+        parse_warning = None
+        total_parsed = sum(len(p.bill_items) for p in all_page_results)
+        if total_parsed == 0 and gem.token_usage.output_tokens > 0:
+            parse_warning = (
+                f"Model returned {gem.token_usage.output_tokens:,} output tokens "
+                f"but no line items parsed from any of {len(all_page_results)} "
+                f"page(s). Response shapes seen -- "
+                f"{'; '.join(empty_diagnostics[:6])}. "
+                f"Try BATCH_SIZE=1: dense pages batched together are the usual cause."
+            )
+            logger.error(parse_warning)
+
+        partial_warning = None
+        if gem.calls_failed:
+            partial_warning = (
+                f"{gem.calls_failed} of {gem.calls_attempted} page batches "
+                f"failed; results are incomplete. Last error -- {gem.last_error}"
+            )
+            logger.warning(partial_warning)
 
         if all_fraud_flags:
             logger.warning(f"FRAUD FLAGS detected: {all_fraud_flags}")
@@ -598,14 +809,95 @@ class BillExtractor:
             for item in p.bill_items
         )
 
+        reconciliation = self._reconcile(all_page_results, grand_total)
+        if reconciliation.matches is False:
+            logger.warning(
+                "RECONCILIATION FAILED: extracted %.2f vs printed %.2f (%.1f%%)",
+                reconciliation.computed_total,
+                reconciliation.printed_total or 0.0,
+                reconciliation.pct_difference or 0.0,
+            )
+
+        # De-duplicate flags while preserving order; the same observation often
+        # repeats across pages of one bill.
+        seen, unique_flags = set(), []
+        for f in all_fraud_flags:
+            if f not in seen:
+                seen.add(f)
+                unique_flags.append(f)
+
         return ExtractionResponse(
             is_success=True,
             token_usage=self.gemini.token_usage,
+            # Populated only on PARTIAL failure: some pages came back, some did
+            # not. is_success stays true because there is usable data, but the
+            # caller must know it is incomplete.
+            error=partial_warning or parse_warning,
             data=ExtractionData(
                 pagewise_line_items=final_pages,
                 total_item_count=total_items,
                 grand_total=round(grand_total, 2),
+                reconciliation=reconciliation,
+                fraud_flags=unique_flags,
             ),
+        )
+
+    def _reconcile(self, pages: List[PageLineItems], computed: float) -> Reconciliation:
+        """
+        Compare extracted line items against the total printed on the bill.
+
+        Uses the MAXIMUM printed total across pages, not the sum. A multi-page
+        bill repeats a running or final total on several pages, and a summary
+        page restates the whole bill -- adding them would produce a target
+        several times too large. The largest printed figure is the best
+        available estimate of the document's own grand total.
+
+        This is imperfect: an interim bill can print a total larger than the
+        pages provided (several of the sample documents are excerpts of longer
+        bills), which shows up as a large negative difference. That is still
+        useful signal -- it tells you the input was partial.
+        """
+        printed_values = [
+            p.printed_total for p in pages
+            if p.printed_total is not None and p.printed_total > 0
+        ]
+        computed = round(computed, 2)
+
+        if not printed_values:
+            return Reconciliation(
+                printed_total=None,
+                computed_total=computed,
+                matches=None,
+                tolerance_pct=RECONCILE_TOLERANCE_PCT,
+                note="No total printed on the document; nothing to verify against.",
+            )
+
+        printed = round(max(printed_values), 2)
+        diff = round(computed - printed, 2)
+        pct = round(abs(diff) / printed * 100, 2) if printed else None
+        ok = pct is not None and pct <= RECONCILE_TOLERANCE_PCT
+
+        if ok:
+            note = "Extracted items match the printed total."
+        elif diff < 0:
+            note = (
+                f"Extracted total is {abs(diff):,.2f} LOWER than printed - line "
+                f"items were likely missed, or the document is a partial excerpt."
+            )
+        else:
+            note = (
+                f"Extracted total is {diff:,.2f} HIGHER than printed - likely "
+                f"double-counting, e.g. a summary page counted alongside detail pages."
+            )
+
+        return Reconciliation(
+            printed_total=printed,
+            computed_total=computed,
+            difference=diff,
+            pct_difference=pct,
+            matches=ok,
+            tolerance_pct=RECONCILE_TOLERANCE_PCT,
+            note=note,
         )
 
     def _deduplicate(self, pages: List[PageLineItems]) -> List[PageLineItems]:
@@ -624,12 +916,16 @@ class BillExtractor:
         result = []
         for p in pages:
             if p.page_type == "Bill Summary":
-                # Keep the page in output (for reference) but clear items
+                # Keep the page in output (for reference) but clear items.
+                # printed_total is preserved -- the summary page usually carries
+                # the authoritative grand total, which reconciliation needs.
                 result.append(
                     PageLineItems(
                         page_no=p.page_no,
                         page_type=p.page_type,
                         bill_items=[],
+                        printed_total=p.printed_total,
+                        fraud_flags=p.fraud_flags,
                     )
                 )
             else:

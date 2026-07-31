@@ -25,6 +25,52 @@ class PageLineItems(BaseModel):
     bill_items: List[BillItem] = Field(
         default_factory=list, description="Extracted line items from this page"
     )
+    printed_total: Optional[float] = Field(
+        None,
+        description=(
+            "Grand total as PRINTED on this page, copied verbatim. Null if the "
+            "page shows no total. Used to verify the extracted line items."
+        ),
+    )
+    fraud_flags: List[str] = Field(
+        default_factory=list,
+        description="Suspicious observations reported by the model for this page",
+    )
+
+
+class Reconciliation(BaseModel):
+    """
+    Cross-check of extracted line items against the total printed on the bill.
+
+    This is the cheapest quality signal available: the document states its own
+    answer, so we can detect dropped rows or double-counting per request without
+    any labelled data. `matches` false means the extraction is provably wrong
+    somewhere, which is far more actionable than a confidence score.
+    """
+
+    printed_total: Optional[float] = Field(
+        None, description="Total printed on the bill (max across pages)"
+    )
+    computed_total: float = Field(
+        0.0, description="Sum of extracted line items, excluding Bill Summary pages"
+    )
+    difference: Optional[float] = Field(
+        None, description="computed_total - printed_total"
+    )
+    pct_difference: Optional[float] = Field(
+        None, description="Difference as a percentage of the printed total"
+    )
+    matches: Optional[bool] = Field(
+        None,
+        description=(
+            "True if within tolerance, False if not, None if the bill printed "
+            "no total to compare against"
+        ),
+    )
+    tolerance_pct: float = Field(
+        1.0, description="Percentage tolerance used for the match decision"
+    )
+    note: Optional[str] = Field(None, description="Human-readable interpretation")
 
 
 class ExtractionData(BaseModel):
@@ -40,6 +86,14 @@ class ExtractionData(BaseModel):
     )
     sub_totals: Optional[dict] = Field(
         None, description="Category-wise subtotals if present on the bill"
+    )
+    reconciliation: Optional[Reconciliation] = Field(
+        None,
+        description="Check of extracted items against the total printed on the bill",
+    )
+    fraud_flags: List[str] = Field(
+        default_factory=list,
+        description="All fraud observations across pages, de-duplicated",
     )
 
 

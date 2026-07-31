@@ -60,11 +60,36 @@ ExtractionResponse JSON
       }
     ],
     "total_item_count": 42,
-    "grand_total": 73420.25
+    "grand_total": 73420.25,
+    "reconciliation": {
+      "printed_total": 73420.25,
+      "computed_total": 73420.25,
+      "difference": 0.0,
+      "pct_difference": 0.0,
+      "matches": true,
+      "note": "Extracted items match the printed total."
+    },
+    "fraud_flags": []
   },
   "error": null
 }
 ```
+
+### Reconciliation
+
+Every bill states its own grand total, so the extractor copies that printed
+figure and compares it against the sum of the line items it extracted. This is a
+correctness check that needs no labelled data:
+
+| `matches` | meaning |
+|---|---|
+| `true` | extracted items sum to the printed total (within 1%) |
+| `false` | **provably wrong** — rows were missed, or something was double-counted |
+| `null` | the document printed no total, so nothing to verify against |
+
+A negative `difference` means items were missed or the upload was a partial
+excerpt; a positive one usually means a summary page was counted alongside
+detail pages. Use it as a per-request confidence signal.
 
 `page_type` values: `Bill Summary` | `Bill Detail` | `Pharmacy Bill` | `Lab Bill` | `Other`
 
@@ -160,21 +185,32 @@ docker run -p 8000:8000 --env-file .env medical-bill-extractor
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Primary model |
 | `GEMINI_MODEL_FALLBACKS` | `gemini-2.0-flash,gemini-1.5-flash` | Fallback models |
 | `MAX_RETRIES` | `5` | Retries per model before switching |
+| `MAX_BACKOFF_SECONDS` | `8` | Cap on exponential back-off between retries |
 | `BATCH_SIZE` | `3` | Pages per Gemini API call |
 | `PDF_DPI` | `200` | DPI for PDF rendering |
 | `USE_MOCK_MODE` | `false` | Return dummy data (no API calls) |
+| `RECONCILE_TOLERANCE_PCT` | `1.0` | Tolerance when checking against the printed total |
+| `USE_OCR_HINT` | `true` | Send the OCR text hint alongside the image |
+| `OCR_MAX_CHARS` | `6000` | Max OCR hint length per page |
+| `OCR_WORKERS` | `min(4, cpus)` | Parallel OCR workers (sets `OMP_THREAD_LIMIT=1`) |
+| `OCR_AUTOROTATE` | `true` | Correct page orientation via Tesseract OSD |
+| `OCR_MIN_CONFIDENCE` | `35` | Drop the hint below this mean word confidence |
+| `MAX_DOWNLOAD_BYTES` | `52428800` | Upload / download size cap |
+| `DOWNLOAD_TIMEOUT_S` | `30` | Timeout when fetching a document URL |
 
 ---
 
 ## Differentiators
 
-1. **Multimodal extraction** — Page images are sent directly to Gemini so it can read tables, handwriting, stamps, and rotated text that OCR alone misses.
-2. **OCR hint** — Tesseract output is passed alongside the image as a text hint, improving accuracy on printed text.
-3. **Fraud detection** — Gemini is prompted to flag mismatched fonts, white-out over text, and rate × quantity mismatches.
-4. **Anti-double-counting** — Bill Summary pages are automatically suppressed when Detail pages are present.
-5. **Multilingual support** — Tesseract with Hindi (`hin`) language pack handles bilingual bills.
-6. **Quota resilience** — Automatic retry with exponential back-off + model fallback list.
-7. **Pre-processing** — Contrast enhancement and median filtering improve OCR quality on low-quality scans.
+1. **Self-verifying output** — Every response reconciles the extracted line items against the total printed on the bill, so a wrong extraction is detectable per request without any labelled data.
+2. **Multimodal extraction** — Page images are sent directly to Gemini so it can read tables, handwriting, stamps, and rotated text that OCR alone misses.
+3. **Measured OCR pipeline** — `--psm 6` plus contrast/sharpness preprocessing, chosen by scoring against `pdftotext` ground truth: 80.7% F1 on numeric tokens versus 6.2% for Tesseract's default segmentation mode.
+4. **Auto-rotation** — Tesseract OSD corrects sideways pages before both OCR and the API call; without it a 90°-rotated page returns noise.
+5. **Anti-double-counting** — Bill Summary pages are suppressed when Detail pages are present, while preserving their printed totals for reconciliation.
+6. **Repeated-row safety** — Identical rows are never merged. Hospital bills legitimately charge the same service 20 times, and collapsing them silently deletes money.
+7. **Multilingual support** — Tesseract with Hindi (`hin`) language pack handles bilingual bills.
+8. **Quota resilience** — Capped exponential back-off with a model fallback list, skipping retries for non-retryable errors.
+9. **SSRF-hardened URL intake** — The URL endpoint resolves and rejects private, loopback and link-local addresses, and enforces size and time limits.
 
 ---
 

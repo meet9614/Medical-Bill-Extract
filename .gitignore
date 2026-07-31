@@ -6,3 +6,13 @@ __pycache__/
 
 # Scratch page renders (images of real patient bills - do not commit)
 _inspect/
+_verify/
+
+# attachments.zip unpacked. Same real patient bills, just browsable -- keep the
+# archive as the single copy rather than committing 15 loose PDFs of PHI.
+samples/
+
+# Hand-labelled ground truth is derived from those bills and contains item
+# descriptions from real patient records.
+eval/gold/
+eval/results.json

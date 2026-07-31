@@ -75,6 +75,44 @@ class TestHelpers:
         assert page.bill_items[0].item_amount == 0.0
 
 
+class TestRepeatedItems:
+    """
+    Hospital bills legitimately repeat identical rows -- 20 identical glucometer
+    charges, or the same consultation fee on consecutive days. Collapsing them
+    silently deletes money, so nothing in the pipeline may deduplicate items.
+    """
+
+    def test_identical_items_are_all_preserved(self):
+        raw = json.dumps({
+            "page_no": "1",
+            "page_type": "Bill Detail",
+            "bill_items": [
+                {"item_name": "BLOOD SUGAR BY GLUCOMETER", "item_amount": 80.0}
+                for _ in range(20)
+            ],
+        })
+        page, _ = _parse_page_result(raw, 1)
+        assert len(page.bill_items) == 20
+        assert sum(i.item_amount for i in page.bill_items) == 1600.0
+
+    def test_printed_total_is_parsed(self):
+        raw = json.dumps({
+            "page_no": "1", "page_type": "Bill Detail",
+            "bill_items": [{"item_name": "X", "item_amount": 100.0}],
+            "printed_total": 100.0,
+        })
+        page, _ = _parse_page_result(raw, 1)
+        assert page.printed_total == 100.0
+
+    def test_missing_printed_total_is_none(self):
+        raw = json.dumps({
+            "page_no": "1", "page_type": "Bill Detail",
+            "bill_items": [{"item_name": "X", "item_amount": 100.0}],
+        })
+        page, _ = _parse_page_result(raw, 1)
+        assert page.printed_total is None
+
+
 class TestDeduplication:
     def test_summary_suppressed_when_detail_present(self):
         extractor = BillExtractor()
@@ -132,6 +170,80 @@ class TestExtractFromURL:
     def test_missing_document_field(self):
         r = client.post("/extract-bill-data", json={})
         assert r.status_code == 422  # Pydantic validation error
+
+    def test_rejects_non_http_scheme(self):
+        r = client.post("/extract-bill-data", json={"document": "file:///etc/passwd"})
+        assert r.status_code == 400
+
+    def test_blocks_link_local_metadata_address(self):
+        """SSRF guard: cloud instance metadata must not be reachable."""
+        r = client.post(
+            "/extract-bill-data",
+            json={"document": "http://169.254.169.254/latest/meta-data/"},
+        )
+        assert r.status_code == 400
+        assert "non-public" in r.json()["detail"].lower()
+
+    def test_blocks_private_network(self):
+        r = client.post("/extract-bill-data", json={"document": "http://10.0.0.5/bill.pdf"})
+        assert r.status_code == 400
+
+
+class TestReconciliation:
+    """The printed-total cross-check is the main label-free quality signal."""
+
+    def _extractor(self):
+        from app.extractor import BillExtractor
+
+        return BillExtractor.__new__(BillExtractor)  # skip Gemini client setup
+
+    def _page(self, page_type, items, printed=None):
+        return PageLineItems(
+            page_no="1",
+            page_type=page_type,
+            bill_items=[BillItem(item_name=n, item_amount=a) for n, a in items],
+            printed_total=printed,
+        )
+
+    def test_matching_totals(self):
+        pages = [self._page("Bill Detail", [("A", 1000.0), ("B", 500.0)], printed=1500.0)]
+        r = self._extractor()._reconcile(pages, 1500.0)
+        assert r.matches is True
+        assert r.difference == 0.0
+
+    def test_missed_items_detected(self):
+        pages = [self._page("Bill Detail", [("A", 1000.0)], printed=1500.0)]
+        r = self._extractor()._reconcile(pages, 1000.0)
+        assert r.matches is False
+        assert r.difference == -500.0
+        assert "LOWER" in r.note
+
+    def test_double_counting_detected(self):
+        pages = [self._page("Bill Detail", [("A", 3000.0)], printed=1500.0)]
+        r = self._extractor()._reconcile(pages, 3000.0)
+        assert r.matches is False
+        assert "HIGHER" in r.note
+
+    def test_uses_max_printed_total_not_sum(self):
+        """A total repeated across pages must not be added up."""
+        pages = [
+            self._page("Bill Detail", [("A", 1000.0)], printed=1500.0),
+            self._page("Bill Summary", [], printed=1500.0),
+            self._page("Bill Detail", [("B", 500.0)], printed=1500.0),
+        ]
+        r = self._extractor()._reconcile(pages, 1500.0)
+        assert r.printed_total == 1500.0
+        assert r.matches is True
+
+    def test_no_printed_total_is_unknown_not_failure(self):
+        pages = [self._page("Bill Detail", [("A", 100.0)])]
+        r = self._extractor()._reconcile(pages, 100.0)
+        assert r.matches is None
+        assert r.printed_total is None
+
+    def test_rounding_within_tolerance(self):
+        pages = [self._page("Bill Detail", [("A", 1495.0)], printed=1500.0)]
+        assert self._extractor()._reconcile(pages, 1495.0).matches is True
 
 
 class TestExtractFromFile:
