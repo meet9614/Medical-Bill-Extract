@@ -15,22 +15,29 @@ PDF / Image
 pdf2image (poppler)          ← Render each page at configurable DPI
     │
     ▼
-Pillow image enhancement     ← Contrast / sharpness boost
-    │
-    ├──▶ pytesseract OCR     ← Raw text hint (handles printed text well)
-    │
+Tesseract OSD auto-rotate    ← Correct sideways scans (applied to BOTH the
+    │                          OCR input and the image sent to the model)
     ▼
-Gemini 2.5 Flash (multimodal) ← Page image + OCR hint → structured JSON
+Pillow enhancement + OCR     ← Contrast/sharpness, --psm 6, run in parallel
+    │                          across pages (OMP_THREAD_LIMIT=1)
+    ▼
+Gemini (multimodal)          ← Page image + OCR hint → JSON mode
     │
-    ├── Retry + fallback model list (quota resilience)
+    ├── Capped back-off, model fallback list, non-retryable errors skipped
     ├── Batch pages to reduce API calls
     │
     ▼
-Deduplication logic          ← Suppress Bill Summary when Detail pages exist
-    │
+Aggregation                  ← Suppress Bill Summary when Detail pages exist
+    │                          (identical rows are NEVER merged)
+    ▼
+Reconciliation               ← Compare extracted sum vs the total printed
+    │                          on the bill; flag any mismatch
     ▼
 ExtractionResponse JSON
 ```
+
+The OCR hint is an accuracy aid, not a dependency — the model receives the page
+image regardless. Set `USE_OCR_HINT=false` to skip it and save ~1–2s/page.
 
 ---
 
@@ -95,6 +102,38 @@ detail pages. Use it as a per-request confidence signal.
 
 ---
 
+## Verified results
+
+Measured on the supplied sample bills, not estimated.
+
+**`train_sample_1`** — 2-page printed hospital bill, 38 line items extracted.
+Reconciliation: extracted total ₹73,420.25 against the printed
+`Grand Total: 73,420.25` — exact. Verified independently against the rendered
+page, so the match is not the model checking its own arithmetic. Category
+subtotals (`Total of PATHOLOGY`) correctly excluded from line items, and a
+pathology subtotal spanning both pages handled correctly.
+
+**`train_sample_3`** — handwritten pharmacy invoice, **rotated 90°**,
+photographed on a desk. Auto-rotation corrected it; both drugs read correctly
+(`Lozivate-MF ₹163`, second item at 8.9 × 30 = ₹266.94); classified
+`Pharmacy Bill`; reconciled ₹429.94 against a printed ₹430.00, the 6-paisa
+rounding gap absorbed by the 1% tolerance. Raised a genuine fraud flag for a
+handwritten alteration over a printed amount.
+
+**OCR configuration** — chosen by scoring against `pdftotext` ground truth:
+
+| variant | token F1 | number F1 |
+|---|---|---|
+| **current** (contrast 2.0 + sharpness 2.0 + median 3, `--psm 6`) | **69.5%** | **80.7%** |
+| no preprocessing, psm 6 | 58.9% | 75.1% |
+| current preprocessing, psm 3 (Tesseract default) | 41.9% | 6.2% |
+
+Note that Tesseract confidence **cannot** detect handwriting — measured means
+overlap (handwritten 59.3/49.5 vs printed 65.5/86.8/88.8/74.2), so
+`OCR_MIN_CONFIDENCE` is only a catastrophic-failure guard.
+
+---
+
 ## Setup
 
 ### 1. System dependencies
@@ -115,20 +154,48 @@ pip install -r requirements.txt
 
 ### 3. Configure environment
 
-```bash
-cp .env.example .env
-# Edit .env and set GOOGLE_API_KEY
+Create `.env` in the repo root:
+
+```
+GOOGLE_API_KEY=your-key-here
+GEMINI_MODEL=gemini-flash-latest
+USE_MOCK_MODE=false
 ```
 
-### 4. Run
+### 4. Pick a model that your key can actually use
+
+Model availability changes, and a retired model returns a 404 that looks like an
+auth failure. This script lists what your key supports **and makes a real
+`generateContent` call** — listing models alone is not proof, since a restricted
+project will list everything and then refuse every request:
+
+```bash
+python list_models.py
+```
+
+Copy the suggested `GEMINI_MODEL` into `.env`.
+
+### 5. Run
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Swagger UI: [http://localhost:8000/docs](http://13.206.108.88:8000/docs)
+Swagger UI: <http://localhost:8000/docs>
 
-Frontend: [https://medical-bill-extract-2ashatbzcxn9fkhejaxboe.streamlit.app/](https://medical-bill-extract-2ashatbzcxn9fkhejaxboe.streamlit.app/)
+Check the backend is configured as you expect before uploading anything:
+
+```bash
+curl -s localhost:8000/health
+# {"status":"ok","model":"gemini-flash-latest","mock_mode":false,...}
+```
+
+### 6. Frontend (optional)
+
+```bash
+streamlit run app_ui.py                              # talks to localhost:8000
+MEDIDATA_API=http://your-host:8000 streamlit run app_ui.py   # or a deployment
+```
 
 ---
 
@@ -136,8 +203,14 @@ Frontend: [https://medical-bill-extract-2ashatbzcxn9fkhejaxboe.streamlit.app/](h
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Liveness check |
-| POST | `/extract-from-file` | Extract from file upload |
+| GET | `/health` | Liveness check; reports active model and mock-mode state |
+| POST | `/extract-bill-data` | Extract from a document URL |
+| POST | `/extract-from-file` | Extract from a file upload |
+
+Both extraction endpoints cap request size (`MAX_DOWNLOAD_BYTES`, default 50MB).
+The URL endpoint resolves the hostname and rejects private, loopback and
+link-local addresses — without that check, a caller could reach cloud instance
+metadata or internal services through the API.
 
 ### Extract from URL
 
@@ -159,12 +232,31 @@ curl -X POST http://localhost:8000/extract-from-file \
 ## Testing
 
 ```bash
-# Fast (no API key needed – mock mode)
-pytest -q
-
-# With real API
-USE_MOCK_MODE=false pytest -q -m integration
+pytest -q      # 31 tests, mock mode, no API key, no cost
 ```
+
+The suite forces `USE_MOCK_MODE=true`, so it never calls the API. Anything that
+does belongs behind the registered `integration` marker.
+
+### Measuring accuracy
+
+Reconciliation tells you *when* an extraction is wrong; only labelled data tells
+you *how* wrong. `eval/score.py` bootstraps a labelling template from current
+output, which you then correct by hand:
+
+```bash
+python -m eval.score --make-template samples/train_sample_1.pdf
+# edit eval/gold/train_sample_1.json, set "verified": true
+python -m eval.score --score
+```
+
+It reports precision/recall/F1 on line items, matching on name **and** amount so
+a model that invents plausible names with wrong numbers scores badly. Matching is
+one-to-one, so a single predicted row cannot satisfy 20 identical gold rows.
+
+It also cross-checks whether reconciliation predicts real accuracy — if F1 is
+clearly higher on documents that reconcile, that signal is trustworthy on
+unlabelled bills in production.
 
 ---
 
@@ -182,11 +274,12 @@ docker run -p 8000:8000 --env-file .env medical-bill-extractor
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GOOGLE_API_KEY` | — | **Required.** Google AI API key |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Primary model |
-| `GEMINI_MODEL_FALLBACKS` | `gemini-2.0-flash,gemini-1.5-flash` | Fallback models |
+| `GEMINI_MODEL` | `gemini-flash-latest` | Primary model. Run `list_models.py` to verify |
+| `GEMINI_MODEL_FALLBACKS` | `gemini-2.0-flash,gemini-flash-latest` | Tried in order if the primary fails |
 | `MAX_RETRIES` | `5` | Retries per model before switching |
 | `MAX_BACKOFF_SECONDS` | `8` | Cap on exponential back-off between retries |
-| `BATCH_SIZE` | `3` | Pages per Gemini API call |
+| `MAX_OUTPUT_TOKENS` | `16384` | Raise if dense multi-page batches return empty |
+| `BATCH_SIZE` | `3` | Pages per Gemini API call. Lower it if dense pages come back empty |
 | `PDF_DPI` | `200` | DPI for PDF rendering |
 | `USE_MOCK_MODE` | `false` | Return dummy data (no API calls) |
 | `RECONCILE_TOLERANCE_PCT` | `1.0` | Tolerance when checking against the printed total |
@@ -214,19 +307,62 @@ docker run -p 8000:8000 --env-file .env medical-bill-extractor
 
 ---
 
+## Troubleshooting
+
+Failures here are reported explicitly rather than silently — an empty result is
+never returned as success. Check the `error` field first.
+
+**`404 ... is no longer available` / `is not found for API version`**
+The model name is retired or absent on your key — not an auth problem. Run
+`python list_models.py` and update `GEMINI_MODEL`.
+
+**`429 ... quota_value: 20`**
+Free tier allows ~20 requests/day/model. At `BATCH_SIZE=3` that is roughly one
+pass over a 50-page corpus per day, with no margin for retries or evaluation.
+A full pass costs around USD 0.20 on billing; enable it if you are iterating.
+
+**Results come back as `Mock Item 1`**
+`USE_MOCK_MODE` is on. An **exported shell variable overrides `.env`**, so check
+the shell too, and note `--reload` does not re-read `.env` — restart fully.
+`curl localhost:8000/health` reports the effective state.
+
+**Zero items but non-zero `output_tokens`**
+The model answered and nothing parsed. The `error` field names the response
+shape. Usually a dense multi-page batch: lower `BATCH_SIZE` or raise
+`MAX_OUTPUT_TOKENS`.
+
+**`ModuleNotFoundError: No module named 'app'` under pytest**
+`pytest.ini` sets `pythonpath = .` — run pytest from the repo root.
+
+**OCR is slower with more workers**
+Tesseract is already internally multi-threaded; concurrent instances
+oversubscribe the CPU. `extractor.py` sets `OMP_THREAD_LIMIT=1` automatically
+when `OCR_WORKERS > 1`. Measured on 4 cores: 2 pages took 2.40s serial, 17.42s
+with 2 workers unrestricted, and 2.1× faster than serial once the limit is set.
+
+---
+
 ## Project Structure
 
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI routes
-│   ├── extractor.py   # Core pipeline (OCR + Gemini + aggregation)
-│   └── schemas.py     # Pydantic models
+│   ├── main.py         # FastAPI routes, URL intake + SSRF guards
+│   ├── extractor.py    # Core pipeline (rotate → OCR → Gemini → reconcile)
+│   └── schemas.py      # Pydantic models
+├── eval/
+│   └── score.py        # Label templates + accuracy scoring (stdlib only)
 ├── tests/
-│   └── test_api.py    # Unit + API tests
+│   └── test_api.py     # 31 unit + API tests, all in mock mode
+├── app_ui.py           # Streamlit frontend
+├── list_models.py      # Which models can this key actually call?
+├── DATA_NOTES.md       # What is actually in the sample bills — read this
 ├── Dockerfile
-├── render.yaml
-├── requirements.txt
 ├── pytest.ini
-└── .env.example
+└── requirements.txt
 ```
+
+[`DATA_NOTES.md`](DATA_NOTES.md) documents the sample corpus: 12 of 15 files are
+scanned images, two "samples" are slices of the same 90-page bill, repeated line
+items are legitimate and must never be deduplicated, and the anonymisation
+white-boxes look exactly like the fraud signal being prompted for.
