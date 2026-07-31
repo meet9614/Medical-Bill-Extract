@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -72,15 +73,69 @@ def _write(rows: list[dict], name: str) -> Path:
 
 
 # ── Stage A ────────────────────────────────────────────────────────────────
-def build_rvl_cdip(per_class: int, image_dir: Path) -> None:
+def _open_rvl_cdip():
+    """
+    Open RVL-CDIP without touching a dataset loading script.
+
+    `aharley/rvl_cdip` ships a Python loading script. That path is a dead end:
+
+      * datasets >= 3.0 removed script-based loading entirely, and
+      * pinning back to datasets 2.x breaks against modern huggingface_hub,
+        whose URI parser rejects the bare repo id the script uses internally
+        ("Repository id must be 'namespace/name', got 'rvl_cdip'").
+
+    So there is no version pair where the script works. Patching the cached
+    script is treating the symptom. Instead we load Parquet directly -- HF
+    auto-converts every dataset to Parquet on the `refs/convert/parquet`
+    branch, which needs no script and no trust_remote_code.
+
+    Override with RVL_CDIP_REPO if you mirror it somewhere else.
+    """
     from datasets import load_dataset
 
+    repo = os.getenv("RVL_CDIP_REPO", "aharley/rvl_cdip")
+    attempts = [
+        ({"path": repo, "split": "train", "streaming": True}, "native parquet"),
+        ({"path": repo, "split": "train", "streaming": True,
+          "revision": "refs/convert/parquet"}, "auto-converted parquet branch"),
+    ]
+
+    errors = []
+    for kwargs, label in attempts:
+        try:
+            ds = load_dataset(**kwargs)
+            print(f"  loaded {repo} via {label}")
+            return ds
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"    {label}: {type(e).__name__}: {str(e)[:160]}")
+
+    raise SystemExit(
+        f"Could not open {repo} without a loading script.\n"
+        + "\n".join(errors)
+        + "\n\n"
+        "  Stage A is OPTIONAL. It exists to teach the adapter the task shape\n"
+        "  (page image in, class label out) on data large enough to move\n"
+        "  weights. Stage B (CORD) already teaches the JSON extraction format.\n\n"
+        "  To proceed without it, skip straight to stage B and train stage_b\n"
+        "  with no --init, then stage C on top:\n\n"
+        "    python -m vlm.data.build_datasets --stage cord\n"
+        "    python -m vlm.train.train_lora --data stage_b_cord_train --out stage_b --epochs 2\n"
+        "    python -m vlm.train.train_lora --data stage_c_medical_train --out stage_c "
+        "--init stage_b --epochs 6 --lr 5e-5\n\n"
+        "  Then say so in the report: classification had no large-scale\n"
+        "  pretraining stage, only 32 medical pages. That is a real limitation\n"
+        "  and reviewers respect it stated plainly.\n\n"
+        "  Or point RVL_CDIP_REPO at a parquet mirror you trust."
+    )
+
+
+def build_rvl_cdip(per_class: int, image_dir: Path) -> None:
     image_dir.mkdir(parents=True, exist_ok=True)
     prompt = CLASSIFY_PROMPT.format(classes="\n".join(f"- {c}" for c in RVL_CDIP_CLASSES))
 
     # Streamed: the full corpus is ~400k images / tens of GB and Colab's disk
     # will not hold it. We take a balanced slice instead.
-    ds = load_dataset("aharley/rvl_cdip", split="train", streaming=True)
+    ds = _open_rvl_cdip()
     counts = {i: 0 for i in range(len(RVL_CDIP_CLASSES))}
     rows, seen = [], 0
 
