@@ -135,12 +135,15 @@ OCR_AUTOROTATE = os.getenv("OCR_AUTOROTATE", "true").lower() == "true"
 # confidence CANNOT be used to detect handwriting, and a threshold tuned to
 # catch the handwritten pages would also silently discard good printed ones.
 #
-# 35 therefore only catches pages where OCR has collapsed completely. Whether
-# dropping hints on handwriting actually helps is an open question -- settle it
-# with `python -m vlm.eval.ocr_ab --mode ab`, not with a guessed threshold.
+# 35 therefore only catches pages where OCR has collapsed completely. Do not
+# raise it to try to catch handwriting -- the measurements above show it would
+# discard good printed pages at the same time.
 OCR_MIN_CONFIDENCE = float(os.getenv("OCR_MIN_CONFIDENCE", "35"))
 
-# Master switch for the A/B: does the OCR hint earn its latency at all?
+# The model receives the page image regardless, so the OCR hint is an optional
+# accuracy aid, not a dependency. Set USE_OCR_HINT=false to skip it and save
+# ~1-2s/page; compare extracted totals with it on and off to decide whether it
+# earns that latency on your documents.
 USE_OCR_HINT = os.getenv("USE_OCR_HINT", "true").lower() == "true"
 
 # ── System prompt for Gemini ───────────────────────────────────────────────

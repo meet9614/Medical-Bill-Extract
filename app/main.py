@@ -16,7 +16,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from app.local_backend import build_extractor
+from app.extractor import BillExtractor
 from app.schemas import ExtractionResponse
 
 app = FastAPI(
@@ -32,8 +32,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Backend is chosen by EXTRACTOR_BACKEND (gemini | local); see app/local_backend.py
-extractor = build_extractor()
+extractor = BillExtractor()
 
 
 class DocumentURLRequest(BaseModel):
@@ -42,16 +41,10 @@ class DocumentURLRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    backend = os.getenv("EXTRACTOR_BACKEND", "gemini").lower()
     return {
         "status": "ok",
         "version": "2.0.0",
-        "backend": backend,
-        "model": (
-            os.getenv("VLM_MODEL_ID", "Qwen/Qwen2-VL-2B-Instruct")
-            if backend == "local"
-            else os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-        ),
+        "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
     }
 
 

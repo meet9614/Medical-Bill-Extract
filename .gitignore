@@ -6,8 +6,3 @@ __pycache__/
 
 # Scratch page renders (images of real patient bills - do not commit)
 _inspect/
-
-# VLM pipeline outputs: rendered pages, distilled labels, adapters, results.
-# Contains PHI (rendered bill pages) and large binaries (LoRA weights,
-# RVL-CDIP/CORD image caches). All of it is regenerable.
-vlm/artifacts/
