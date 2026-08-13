@@ -15,11 +15,15 @@ PDF / Image
 pdf2image (poppler)          ← Render each page at configurable DPI
     │
     ▼
-Tesseract OSD auto-rotate    ← Correct sideways scans (applied to BOTH the
-    │                          OCR input and the image sent to the model)
+Tesseract OSD auto-rotate    ← Correct sideways scans, 90° steps (applied to
+    │                          BOTH the OCR input and the image sent to Gemini)
+    ▼
+OpenCV fine-angle deskew     ← The remaining few degrees of tilt from a photo,
+    │                          which OSD cannot fix. Skipped on upright pages.
     ▼
 Pillow enhancement + OCR     ← Contrast/sharpness, --psm 6, run in parallel
-    │                          across pages (OMP_THREAD_LIMIT=1)
+    │                          across pages (OMP_THREAD_LIMIT=1).
+    │                          Engine switchable: Tesseract or PaddleOCR.
     ▼
 Gemini (multimodal)          ← Page image + OCR hint → JSON mode
     │
@@ -128,6 +132,33 @@ handwritten alteration over a printed amount.
 | no preprocessing, psm 6 | 58.9% | 75.1% |
 | current preprocessing, psm 3 (Tesseract default) | 41.9% | 6.2% |
 
+**OpenCV deskew** — added only after measuring it in two roles. As a *replacement*
+for the Pillow pre-processing it was consistently worse, so it isn't used that way:
+
+| variant | token F1 | number F1 |
+|---|---|---|
+| **Pillow (kept)** | **69.5%** | **80.7%** |
+| OpenCV adaptive threshold | 66.8% | 75.1% |
+| OpenCV denoise + Otsu | 58.0% | 73.3% |
+| OpenCV CLAHE | 59.8% | 77.0% |
+
+For *deskew*, which the Pillow chain cannot do at all, it wins clearly:
+
+| page state | token F1 | number F1 |
+|---|---|---|
+| straight | 69.5% | 80.7% |
+| tilted 2°, no deskew | 58.8% | 60.6% |
+| **tilted 2°, with deskew** | **64.2%** | **73.4%** |
+| tilted 4°, no deskew | 48.2% | 46.7% |
+| **tilted 4°, with deskew** | **60.2%** | **72.3%** |
+
+Upright pages detect 0° and are left untouched — rotation always costs a little
+sharpness, so it's only applied when it pays for itself.
+
+**PaddleOCR** is wired in as a switchable backend (`OCR_ENGINE=paddle`) with
+automatic fallback to Tesseract. It is **not yet benchmarked** against Tesseract
+on this corpus.
+
 Note that Tesseract confidence **cannot** detect handwriting — measured means
 overlap (handwritten 59.3/49.5 vs printed 65.5/86.8/88.8/74.2), so
 `OCR_MIN_CONFIDENCE` is only a catastrophic-failure guard.
@@ -142,8 +173,14 @@ overlap (handwritten 59.3/49.5 vs printed 65.5/86.8/88.8/74.2), so
 # Ubuntu / Debian
 sudo apt-get install poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-hin
 
-# macOS
-brew install poppler tesseract
+# macOS  (tesseract-lang provides the Hindi and OSD data files)
+brew install poppler tesseract tesseract-lang
+```
+
+Optional — the alternative OCR engine, several hundred MB:
+
+```bash
+pip install paddlepaddle paddleocr    # then set OCR_ENGINE=paddle
 ```
 
 ### 2. Python dependencies
@@ -286,7 +323,11 @@ docker run -p 8000:8000 --env-file .env medical-bill-extractor
 | `USE_OCR_HINT` | `true` | Send the OCR text hint alongside the image |
 | `OCR_MAX_CHARS` | `6000` | Max OCR hint length per page |
 | `OCR_WORKERS` | `min(4, cpus)` | Parallel OCR workers (sets `OMP_THREAD_LIMIT=1`) |
-| `OCR_AUTOROTATE` | `true` | Correct page orientation via Tesseract OSD |
+| `OCR_AUTOROTATE` | `true` | Correct 90° page orientation via Tesseract OSD |
+| `OCR_DESKEW` | `true` | Correct fine tilt via OpenCV (no-op on upright pages) |
+| `DESKEW_MIN_ANGLE` | `0.3` | Below this, leave the page alone |
+| `DESKEW_MAX_ANGLE` | `15.0` | Above this, assume detection failed |
+| `OCR_ENGINE` | `tesseract` | `tesseract` or `paddle` (falls back if uninstalled) |
 | `OCR_MIN_CONFIDENCE` | `35` | Drop the hint below this mean word confidence |
 | `MAX_DOWNLOAD_BYTES` | `52428800` | Upload / download size cap |
 | `DOWNLOAD_TIMEOUT_S` | `30` | Timeout when fetching a document URL |
@@ -298,7 +339,7 @@ docker run -p 8000:8000 --env-file .env medical-bill-extractor
 1. **Self-verifying output** — Every response reconciles the extracted line items against the total printed on the bill, so a wrong extraction is detectable per request without any labelled data.
 2. **Multimodal extraction** — Page images are sent directly to Gemini so it can read tables, handwriting, stamps, and rotated text that OCR alone misses.
 3. **Measured OCR pipeline** — `--psm 6` plus contrast/sharpness preprocessing, chosen by scoring against `pdftotext` ground truth: 80.7% F1 on numeric tokens versus 6.2% for Tesseract's default segmentation mode.
-4. **Auto-rotation** — Tesseract OSD corrects sideways pages before both OCR and the API call; without it a 90°-rotated page returns noise.
+4. **Two-stage geometry correction** — Tesseract OSD fixes 90° rotations, OpenCV `minAreaRect` deskew fixes the residual few degrees of tilt from phone photos. Both applied before OCR *and* before the API call. Without OSD a sideways page returns pure noise; without deskew a 4° tilt costs 34 points of numeric F1.
 5. **Anti-double-counting** — Bill Summary pages are suppressed when Detail pages are present, while preserving their printed totals for reconciliation.
 6. **Repeated-row safety** — Identical rows are never merged. Hospital bills legitimately charge the same service 20 times, and collapsing them silently deletes money.
 7. **Multilingual support** — Tesseract with Hindi (`hin`) language pack handles bilingual bills.
