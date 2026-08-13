@@ -58,6 +58,14 @@ except ImportError:
     logger.warning("pytesseract / Pillow not available – OCR disabled")
 
 try:
+    import cv2
+    import numpy as np
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+    logger.warning("opencv not available – deskew disabled, pages will be OCR'd as-is")
+
+try:
     import google.generativeai as genai
     GEMINI_AVAILABLE = True
 except ImportError:
@@ -146,6 +154,29 @@ if OCR_WORKERS > 1:
 # Detect and correct page rotation before OCR *and* before sending the image to
 # the model. Measured: a 90-degree-rotated page yields pure noise without this.
 OCR_AUTOROTATE = os.getenv("OCR_AUTOROTATE", "true").lower() == "true"
+
+# Fine-angle deskew with OpenCV. Complements OSD rather than replacing it:
+# Tesseract's OSD only corrects in 90-degree steps, so a page photographed a few
+# degrees off stays crooked, and Tesseract's line finder degrades badly on tilt.
+#
+# Measured on a page with pdftotext ground truth, numeric-token F1:
+#     straight page                       80.7%
+#     tilted 2 deg, no deskew             60.6%   -> with deskew  73.4%
+#     tilted 4 deg, no deskew             46.7%   -> with deskew  72.3%
+#
+# Skipped entirely when the detected angle is under DESKEW_MIN_ANGLE, so upright
+# scans are never resampled (rotation always costs a little sharpness).
+OCR_DESKEW = os.getenv("OCR_DESKEW", "true").lower() == "true"
+DESKEW_MIN_ANGLE = float(os.getenv("DESKEW_MIN_ANGLE", "0.3"))
+DESKEW_MAX_ANGLE = float(os.getenv("DESKEW_MAX_ANGLE", "15.0"))
+
+# Which OCR engine supplies the text hint.
+#   tesseract - default, always available
+#   paddle    - PaddleOCR; better text detection on skewed/photographed pages,
+#               but a several-hundred-MB dependency. Install with:
+#                   pip install paddlepaddle paddleocr
+# Falls back to tesseract automatically if paddle is selected but not installed.
+OCR_ENGINE = os.getenv("OCR_ENGINE", "tesseract").strip().lower()
 
 # Mean word confidence below which the OCR hint is dropped entirely.
 #
@@ -267,6 +298,99 @@ def _autorotate(img):
     return img, 0
 
 
+def _deskew(img):
+    """
+    Correct a small page tilt using OpenCV. Returns (image, degrees applied).
+
+    How it works: threshold the page, take the coordinates of every dark pixel,
+    and ask cv2.minAreaRect for the tightest rotated rectangle around them. On a
+    document that rectangle aligns with the text baselines, so its angle is the
+    page tilt. We then rotate by the NEGATIVE of that angle to flatten it.
+
+    The sign matters and is easy to get wrong -- rotating the same direction as
+    the detected angle doubles the tilt and made OCR markedly worse in testing.
+    """
+    if not (CV2_AVAILABLE and OCR_DESKEW):
+        return img, 0.0
+    try:
+        grey = np.array(img.convert("L"))
+        inverted = cv2.bitwise_not(grey)
+        mask = cv2.threshold(inverted, 0, 255,
+                             cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+        coords = np.column_stack(np.where(mask > 0))
+        if coords.shape[0] < 100:          # nearly blank page, nothing to align
+            return img, 0.0
+
+        angle = cv2.minAreaRect(coords)[-1]
+        # minAreaRect reports within (-90, 0]; normalise to a small signed tilt
+        if angle < -45:
+            angle = 90 + angle
+        elif angle > 45:
+            angle -= 90
+
+        # Ignore noise, and refuse implausible angles -- a genuine 90-degree
+        # rotation is OSD's job, and a wild value here means detection failed.
+        if abs(angle) < DESKEW_MIN_ANGLE or abs(angle) > DESKEW_MAX_ANGLE:
+            return img, 0.0
+
+        height, width = grey.shape
+        matrix = cv2.getRotationMatrix2D((width // 2, height // 2), -angle, 1.0)
+        rotated = cv2.warpAffine(
+            np.array(img.convert("L")), matrix, (width, height),
+            flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE,
+        )
+        logger.info("deskewed page by %.2f degrees", -angle)
+        return Image.fromarray(rotated), -angle
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"deskew failed, using page as-is: {e}")
+        return img, 0.0
+
+
+_paddle_reader = None
+
+
+def _ocr_page_paddle(img) -> str:
+    """
+    OCR via PaddleOCR. Optional alternative to Tesseract.
+
+    Worth trying because Paddle's detection stage handles skewed and
+    photographed text better than Tesseract's, which matters on phone-camera
+    bills. Costs a several-hundred-MB dependency, so it is off by default.
+
+    Returns "" on any failure, which makes the caller fall back to Tesseract.
+    """
+    global _paddle_reader
+    try:
+        if _paddle_reader is None:
+            from paddleocr import PaddleOCR
+            _paddle_reader = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+            logger.info("PaddleOCR initialised")
+
+        result = _paddle_reader.ocr(np.array(img.convert("RGB")), cls=True)
+        if not result or not result[0]:
+            return ""
+
+        # Paddle returns [[box, (text, confidence)], ...] per page.
+        lines = []
+        for entry in result[0]:
+            try:
+                text, confidence = entry[1]
+            except (IndexError, TypeError, ValueError):
+                continue
+            if float(confidence) >= 0.5:
+                lines.append(str(text))
+        return "\n".join(lines).strip()
+
+    except ImportError:
+        logger.warning("OCR_ENGINE=paddle but paddleocr is not installed "
+                       "(pip install paddlepaddle paddleocr) - using tesseract")
+        return ""
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"PaddleOCR failed, falling back to tesseract: {e}")
+        return ""
+
+
 def _ocr_page(img) -> str:
     """
     OCR a PIL image, returning text only if it looks trustworthy.
@@ -279,6 +403,13 @@ def _ocr_page(img) -> str:
     scored 80.7% F1 on numeric tokens versus 6.2% for the psm 3 default. Do not
     "fix" it to auto page segmentation.
     """
+    # Optional alternative engine. If it returns nothing (not installed, or it
+    # failed) we silently continue with Tesseract rather than losing the hint.
+    if OCR_ENGINE == "paddle":
+        text = _ocr_page_paddle(img)
+        if text:
+            return text[:OCR_MAX_CHARS]
+
     if not OCR_AVAILABLE:
         return ""
     try:
@@ -701,8 +832,12 @@ class BillExtractor:
         # from O(n) into O(n / workers). Order is restored by index afterwards.
         def _prepare(idx_img):
             i, img = idx_img
+            # Two stages, in this order and both needed:
+            #   OSD  - fixes 90/180/270 rotations (a sideways scan)
+            #   deskew - fixes the remaining few degrees of tilt from a photo
             img, _deg = _autorotate(img)
-            ocr_text = _ocr_page(img) if OCR_AVAILABLE else ""
+            img, _tilt = _deskew(img)
+            ocr_text = _ocr_page(img) if (OCR_AVAILABLE or OCR_ENGINE == "paddle") else ""
             return i, img, ocr_text
 
         with tempfile.TemporaryDirectory() as tmpdir:

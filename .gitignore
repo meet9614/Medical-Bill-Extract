@@ -16,3 +16,6 @@ samples/
 # descriptions from real patient records.
 eval/gold/
 eval/results.json
+
+# Personal interview notes. NEVER commit - this repo is public.
+interview_prep/
