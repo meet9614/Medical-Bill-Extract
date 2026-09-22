@@ -4,9 +4,61 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# Defaults to the local server. Point at a deployed instance with:
-#   MEDIDATA_API=http://<host>:8000 streamlit run app_ui.py
-API_BASE = os.getenv("MEDIDATA_API", "http://127.0.0.1:8000").rstrip("/")
+# Where the FastAPI backend lives. Checked in priority order:
+#
+#   1. st.secrets      - Streamlit Cloud. Secrets are NOT exported as environment
+#                        variables there, so os.getenv alone would miss them and
+#                        the deployed app would try to reach its own container.
+#   2. MEDIDATA_API    - normal env var, for local runs and Docker
+#   3. localhost       - sensible default when running on your own machine
+#
+# On Streamlit Cloud: Manage app -> Settings -> Secrets, then add
+#     MEDIDATA_API = "http://<your-backend-host>:8000"
+def _secret(name: str) -> str | None:
+    """Read from Streamlit secrets first, then the environment."""
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name])
+    except Exception:
+        pass  # no secrets configured - normal when running locally
+    return os.getenv(name)
+
+
+API_BASE = (_secret("MEDIDATA_API") or "").rstrip("/")
+
+# Two ways to run:
+#
+#   DIRECT MODE (no MEDIDATA_API set) - this app does the extraction itself, in
+#   this same process. Nothing else to deploy and nothing else to keep alive.
+#   This is what Streamlit Cloud uses.
+#
+#   API MODE (MEDIDATA_API set) - forward uploads to a separate FastAPI server.
+#   Useful when the API runs elsewhere, or you want the UI to stay thin.
+DIRECT_MODE = not API_BASE
+
+_extractor = None
+_import_error = None
+
+if DIRECT_MODE:
+    # The extractor reads its config from the environment at import time, so
+    # secrets must be copied across BEFORE importing it.
+    for key in ("GOOGLE_API_KEY", "GEMINI_MODEL", "GEMINI_MODEL_FALLBACKS",
+                "USE_MOCK_MODE", "BATCH_SIZE", "PDF_DPI"):
+        value = _secret(key)
+        if value is not None:
+            os.environ[key] = value
+
+    try:
+        from app.extractor import BillExtractor
+
+        @st.cache_resource(show_spinner=False)
+        def _get_extractor():
+            """Built once per session - loading it per upload would be wasteful."""
+            return BillExtractor()
+
+        _extractor = _get_extractor()
+    except Exception as e:  # noqa: BLE001
+        _import_error = e
 API_URL = f"{API_BASE}/extract-from-file"
 HEALTH_URL = f"{API_BASE}/health"
 
@@ -22,17 +74,32 @@ st.markdown("Upload a medical bill PDF/image and extract structured data using A
 # uploads a file and waits, rather than surfacing as a timeout afterwards.
 with st.sidebar:
     st.subheader("Backend")
-    st.caption(API_BASE)
-    try:
-        health = requests.get(HEALTH_URL, timeout=5).json()
-        st.success("connected")
-        st.write(f"**model:** `{health.get('model')}`")
-        if health.get("mock_mode"):
-            st.warning("MOCK MODE is on — results are dummy data.")
-    except requests.RequestException as e:
-        st.error("cannot reach backend")
-        st.caption(str(e)[:200])
-        st.info("Start it with:\n\n`uvicorn app.main:app --port 8000`")
+
+    if DIRECT_MODE:
+        st.caption("running in this app (no separate server)")
+        if _import_error:
+            st.error("extractor failed to load")
+            st.caption(str(_import_error)[:300])
+        elif not os.getenv("GOOGLE_API_KEY"):
+            st.error("GOOGLE_API_KEY is not set")
+            st.caption("Streamlit Cloud: Manage app → Settings → Secrets")
+        else:
+            st.success("ready")
+            st.write(f"**model:** `{os.getenv('GEMINI_MODEL', 'gemini-flash-latest')}`")
+            if os.getenv("USE_MOCK_MODE", "").lower() == "true":
+                st.warning("MOCK MODE is on — results are dummy data.")
+    else:
+        st.caption(API_BASE)
+        try:
+            health = requests.get(HEALTH_URL, timeout=5).json()
+            st.success("connected")
+            st.write(f"**model:** `{health.get('model')}`")
+            if health.get("mock_mode"):
+                st.warning("MOCK MODE is on — results are dummy data.")
+        except requests.RequestException as e:
+            st.error("cannot reach backend")
+            st.caption(str(e)[:200])
+            st.info("Start it with:\n\n`uvicorn app.main:app --port 8000`")
 
 uploaded_file = st.file_uploader("Upload Bill (PDF/Image)", type=["pdf", "png", "jpg", "jpeg"])
 
@@ -41,28 +108,50 @@ if uploaded_file:
 
     if st.button("Extract Data", type="primary"):
         with st.spinner("Rendering pages, running OCR, calling the model…"):
-            try:
-                response = requests.post(
-                    API_URL,
-                    files={"file": (uploaded_file.name, uploaded_file.getvalue(),
-                                    uploaded_file.type)},
-                    timeout=REQUEST_TIMEOUT_S,
-                )
-            except requests.Timeout:
-                st.error(f"Timed out after {REQUEST_TIMEOUT_S}s. Large scanned "
-                         f"bills can exceed this — raise MEDIDATA_TIMEOUT.")
-                st.stop()
-            except requests.RequestException as e:
-                st.error(f"Could not reach {API_BASE}")
-                st.caption(str(e)[:300])
-                st.stop()
+            if DIRECT_MODE:
+                if _extractor is None:
+                    st.error("Extractor is not available — see the sidebar.")
+                    st.stop()
 
-        if response.status_code != 200:
-            st.error(f"API returned {response.status_code}")
-            st.code(response.text[:1000])
-            st.stop()
+                import tempfile
+                from pathlib import Path
 
-        result = response.json()
+                suffix = Path(uploaded_file.name).suffix.lower() or ".pdf"
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(uploaded_file.getvalue())
+                    tmp_path = tmp.name
+                try:
+                    result = _extractor.extract(tmp_path).model_dump()
+                except Exception as e:  # noqa: BLE001
+                    st.error("Extraction failed")
+                    st.code(str(e)[:1000])
+                    st.stop()
+                finally:
+                    os.unlink(tmp_path)
+
+            else:
+                try:
+                    response = requests.post(
+                        API_URL,
+                        files={"file": (uploaded_file.name, uploaded_file.getvalue(),
+                                        uploaded_file.type)},
+                        timeout=REQUEST_TIMEOUT_S,
+                    )
+                except requests.Timeout:
+                    st.error(f"Timed out after {REQUEST_TIMEOUT_S}s. Large scanned "
+                             f"bills can exceed this — raise MEDIDATA_TIMEOUT.")
+                    st.stop()
+                except requests.RequestException as e:
+                    st.error(f"Could not reach {API_BASE}")
+                    st.caption(str(e)[:300])
+                    st.stop()
+
+                if response.status_code != 200:
+                    st.error(f"API returned {response.status_code}")
+                    st.code(response.text[:1000])
+                    st.stop()
+
+                result = response.json()
 
         if not result.get("is_success"):
             st.error("Extraction failed")

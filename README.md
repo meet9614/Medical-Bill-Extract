@@ -6,17 +6,23 @@ Built for the **Byterverse Hackathon 2026**.
 
 ---
 
-## Live Demo
+## Try it
 
-| | |
-|---|---|
-| **Web app** | https://medical-bill-extract-2ashatbzcxn9fkhejaxboe.streamlit.app/ |
-| **API (Swagger)** | http://13.206.108.88:8000/docs |
-| **Health check** | http://13.206.108.88:8000/health |
-| **Source** | https://github.com/meet9614/Medical-Bill-Extract |
+Runs locally in two commands once set up (full instructions under
+[Setup](#setup)):
 
-Upload a bill PDF or photo and the app returns the extracted line items, the
-grand total, and a check of that total against the one printed on the bill.
+```bash
+uvicorn app.main:app --port 8000     # API  -> http://localhost:8000/docs
+streamlit run app_ui.py              # web UI
+```
+
+Upload a bill PDF or photo and you get back the extracted line items, the grand
+total, and a check of that total against the one printed on the bill.
+
+A hosted demo is at
+[medical-bill-extract…streamlit.app](https://medical-bill-extract-2ashatbzcxn9fkhejaxboe.streamlit.app/),
+but the API backend behind it is currently offline, so run it locally to see it
+working.
 
 ---
 
