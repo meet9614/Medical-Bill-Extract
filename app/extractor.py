@@ -82,13 +82,25 @@ from app.schemas import (
 )
 
 # ── Config ─────────────────────────────────────────────────────────────────
-GOOGLE_API_KEY   = os.getenv("GOOGLE_API_KEY", "")
-# Never log any part of the key. Prefixes are enough to identify a key in a
+def _api_key() -> str:
+    """
+    Read the key at call time, never at import time.
+
+    A module-level constant is captured once, when the module is first imported.
+    That breaks in any host where configuration arrives after the process
+    starts - Streamlit Cloud sets secrets that way, and a process that booted
+    before the secret was saved would hold an empty string forever and report
+    "GOOGLE_API_KEY is missing" even once the key is clearly present.
+    """
+    return os.getenv("GOOGLE_API_KEY", "").strip()
+
+
+# Never log any part of the key. A prefix is enough to identify a key in a
 # leaked log, and server logs routinely end up in shared storage.
 logger.info(
     "config loaded from %s | GOOGLE_API_KEY %s",
     ENV_PATH,
-    "present" if GOOGLE_API_KEY else "MISSING",
+    "present" if _api_key() else "MISSING",
 )
 # Default is the rolling alias, not a pinned version: gemini-1.5-flash and then
 # gemini-2.5-flash both went stale in this repo and 404'd for new keys. Pin an
@@ -532,8 +544,11 @@ def _safe_float(val) -> Optional[float]:
 
 class GeminiCaller:
     def __init__(self):
-        if GEMINI_AVAILABLE and GOOGLE_API_KEY:
-            genai.configure(api_key=GOOGLE_API_KEY)
+        # Configured per instance, from the key as it is RIGHT NOW. The caller
+        # is rebuilt for every extraction, so a key that arrives after start-up
+        # is picked up without needing a restart.
+        if GEMINI_AVAILABLE and _api_key():
+            genai.configure(api_key=_api_key())
         self.model_queue = [GEMINI_MODEL] + FALLBACK_MODELS
         self._input_tokens = 0
         self._output_tokens = 0
@@ -565,8 +580,12 @@ class GeminiCaller:
 
         self.calls_attempted += 1
 
-        if not GEMINI_AVAILABLE or not GOOGLE_API_KEY:
-            logger.error("Gemini not configured – set GOOGLE_API_KEY")
+        if not GEMINI_AVAILABLE or not _api_key():
+            logger.error(
+                "Gemini not configured (google-generativeai installed: %s, "
+                "GOOGLE_API_KEY present: %s)",
+                GEMINI_AVAILABLE, bool(_api_key()),
+            )
             self.calls_failed += 1
             self.last_error = (
                 "Gemini is not configured: GOOGLE_API_KEY is missing or the "
