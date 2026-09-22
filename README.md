@@ -6,6 +6,20 @@ Built for the **Byterverse Hackathon 2026**.
 
 ---
 
+## Live Demo
+
+| | |
+|---|---|
+| **Web app** | https://medical-bill-extract-2ashatbzcxn9fkhejaxboe.streamlit.app/ |
+| **API (Swagger)** | http://13.206.108.88:8000/docs |
+| **Health check** | http://13.206.108.88:8000/health |
+| **Source** | https://github.com/meet9614/Medical-Bill-Extract |
+
+Upload a bill PDF or photo and the app returns the extracted line items, the
+grand total, and a check of that total against the one printed on the bill.
+
+---
+
 ## Architecture
 
 ```
