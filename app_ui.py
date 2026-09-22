@@ -88,6 +88,7 @@ with st.sidebar:
             st.write(f"**model:** `{os.getenv('GEMINI_MODEL', 'gemini-flash-latest')}`")
             if os.getenv("USE_MOCK_MODE", "").lower() == "true":
                 st.warning("MOCK MODE is on — results are dummy data.")
+
     else:
         st.caption(API_BASE)
         try:
@@ -100,6 +101,29 @@ with st.sidebar:
             st.error("cannot reach backend")
             st.caption(str(e)[:200])
             st.info("Start it with:\n\n`uvicorn app.main:app --port 8000`")
+
+    # Shows WHERE config was found, without ever printing the key itself.
+    # Without this, a missing secret looks identical to a broken import.
+    with st.expander("config check"):
+        try:
+            secret_keys = sorted(st.secrets.keys())
+            st.write(f"secrets found: `{secret_keys or 'none'}`")
+        except Exception:
+            st.write("secrets found: `none configured`")
+
+        key = os.getenv("GOOGLE_API_KEY", "")
+        st.write(f"GOOGLE_API_KEY: {'set, ' + str(len(key)) + ' chars' if key else '**MISSING**'}")
+        st.write(f"GEMINI_MODEL: `{os.getenv('GEMINI_MODEL') or 'not set (using default)'}`")
+
+        try:
+            import google.generativeai  # noqa: F401
+            st.write("google-generativeai: installed")
+        except ImportError:
+            st.write("google-generativeai: **NOT INSTALLED**")
+
+        import shutil
+        st.write(f"poppler (pdftoppm): {'found' if shutil.which('pdftoppm') else '**MISSING**'}")
+        st.write(f"tesseract: {'found' if shutil.which('tesseract') else '**MISSING**'}")
 
 uploaded_file = st.file_uploader("Upload Bill (PDF/Image)", type=["pdf", "png", "jpg", "jpeg"])
 
