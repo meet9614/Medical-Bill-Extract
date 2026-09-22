@@ -6,23 +6,25 @@ Built for the **Byterverse Hackathon 2026**.
 
 ---
 
-## Try it
+## Live demo
 
-Runs locally in two commands once set up (full instructions under
-[Setup](#setup)):
+**https://medical-bill-extract-4ygkxtczkbxfh8sqfpnnww.streamlit.app/**
+
+Upload a bill PDF or photo and you get back the extracted line items, the grand
+total, and a check of that total against the total printed on the bill.
+
+The demo runs the extraction inside the Streamlit app itself — no separate API
+server to keep alive. Note it uses a free-tier Gemini key, which allows about
+**20 requests per day**, so it may hit a quota error if several people try it.
+
+### Or run it locally
 
 ```bash
 uvicorn app.main:app --port 8000     # API  -> http://localhost:8000/docs
-streamlit run app_ui.py              # web UI
+streamlit run app_ui.py              # web UI, talks to the API above
 ```
 
-Upload a bill PDF or photo and you get back the extracted line items, the grand
-total, and a check of that total against the one printed on the bill.
-
-A hosted demo is at
-[medical-bill-extract…streamlit.app](https://medical-bill-extract-2ashatbzcxn9fkhejaxboe.streamlit.app/),
-but the API backend behind it is currently offline, so run it locally to see it
-working.
+Full instructions under [Setup](#setup).
 
 ---
 
